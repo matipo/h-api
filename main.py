@@ -14,26 +14,26 @@ app.add_middleware(
 )
 
 # Estructura de caché en memoria local para guardar los semestres ya procesados
-# Estructura: { nivel_semestre: {"timestamp": float, "data": dict} }
 MEMORIA_CACHE = {}
-TIEMPO_EXPIRACION_CACHÉ = 86400  # Guardar los datos localmente por 24 horas (en segundos)
+TIEMPO_EXPIRACION_CACHÉ = 86400  # Guardar los datos localmente por 24 horas
 
-
-URL_BASE_ULAGOS = "https://horarios.ulagos.cl/ptomontt/carreras.php"
-
+# URL base apuntando al sistema de horarios real de la universidad
+URL_BASE_ULAGOS = "https://horarios.ulagos.cl/Global/carrera.php"
 
 def mapear_html_horario(html_content):
     """Procesa el HTML crudo y lo transforma en un diccionario estructurado"""
     soup = BeautifulSoup(html_content, 'html.parser')
-    tabla = soup.find('table', class_='table-schedule') or soup.find('table')
+    
+    # Intenta buscar la tabla por clase o de forma genérica
+    tabla = soup.find('table', class_='table-schedule') or soup.find('table', class_='table') or soup.find('table')
     if not tabla:
         return None
         
-    cuerpo_tabla = tabla.find('tbody')
-    if not cuerpo_tabla:
+    cuerpo_tabla = tabla.find('tbody') or tabla
+    filas = cuerpo_tabla.find_all('tr')
+    if not filas:
         return None
         
-    filas = cuerpo_tabla.find_all('tr')
     horario_completo = []
     dias_semana = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"]
 
@@ -43,11 +43,11 @@ def mapear_html_horario(html_content):
         if any(x in clase_fila_str for x in ['almuerzo', 'text-muted', 'table-light', 'footer']):
             continue
 
-        celdas = fila.find_all('td')
+        celdas = fila.find_all(['td', 'th'])
         if not celdas or len(celdas) < 2:
             continue
             
-        bloque_hora = " ".join(celdas.text.split())
+        bloque_hora = " ".join(celdas[0].text.split())
         if not bloque_hora:
             continue
 
@@ -58,10 +58,15 @@ def mapear_html_horario(html_content):
                 break
                 
             nombre_dia = dias_semana[indice]
-            div_actividad = celda.find('div', class_='actividad')
             
-            if div_actividad:
-                lineas = [l.strip() for l in div_actividad.get_text(separator="\n").split("\n") if l.strip()]
+            # Intenta buscar el div estructurado, si no, extrae el texto directo de la celda
+            div_actividad = celda.find('div', class_='actividad') or celda.find('div')
+            texto_origen = div_actividad if div_actividad else celda
+            
+            texto_limpio = texto_origen.get_text(separator="\n").strip()
+            
+            if texto_limpio and len(texto_limpio) > 3:
+                lineas = [l.strip() for l in texto_limpio.split("\n") if l.strip()]
                 
                 nombre_ramo, codigo, grupo, seccion, docente, sala = "", "", "", "", "", ""
 
@@ -102,32 +107,37 @@ def mapear_html_horario(html_content):
             "clases": ramos_del_bloque
         })
         
-    return [b for b in horario_completo if any(b["clases"].values()) or "13:15" not in b["bloque"]]
+    return [b for b in horario_completo if any(b["clases"].values())]
 
-# Endpoint optimizado con parámetro de ruta para consultar cualquier semestre (del 1 al 10)
+
+# Endpoint optimizado con parámetro de ruta para consultar cualquier semestre (del 1 al 11)
 @app.get("/api/horario/{nivel}")
 def obtener_horario_por_semestre(nivel: int):
-    # Validar que el semestre solicitado se encuentre en el rango académico real
     if nivel < 1 or nivel > 11 or nivel == 6:
         return {"error": "El semestre solicitado debe estar comprendido entre el 1 y el 11 exceptuando el 6."}
 
     tiempo_actual = time.time()
     
-    # Verificación de Caché: Si el semestre ya se consultó y no ha expirado, se retorna de inmediato
     if nivel in MEMORIA_CACHE:
         cache_data = MEMORIA_CACHE[nivel]
         if tiempo_actual - cache_data["timestamp"] < TIEMPO_EXPIRACION_CACHÉ:
             return cache_data["data"]
 
-    # Si no está en caché o ya expiró, se realiza la petición correspondiente a la universidad
     try:
-        # 💻 CORRECCIÓN: Se eliminó la concatenación manual incorrecta con '&'
-        # Si la URL base de la página del horario tiene una ruta específica (ej: "https://ulagos.cl"), 
-        # asegúrate de cambiar el valor de URL_BASE_ULAGOS arriba en tu archivo.
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        parametros = {"nivel": nivel}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
         
-        # requests se encarga automáticamente de armar la URL de forma correcta usando '?'
+        # Parámetros obligatorios estructurados para el formulario institucional
+        parametros = {
+            "carrera": "3216",
+            "nivel": str(nivel),
+            "plan": "3216II2020",
+            "sede": "2028"
+        }
+        
+        # 💻 CORRECCIÓN CRÍTICA: Se cambió requests.get por requests.post enviando los datos mediante 'data'
         respuesta = requests.get(URL_BASE_ULAGOS, headers=headers, params=parametros, timeout=12)
         
         if respuesta.status_code != 200:
@@ -145,7 +155,6 @@ def obtener_horario_por_semestre(nivel: int):
             "horario": datos_procesados
         }
         
-        # Guardar el resultado en la caché en memoria antes de responderle al usuario
         MEMORIA_CACHE[nivel] = {
             "timestamp": tiempo_actual,
             "data": json_respuesta
