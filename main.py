@@ -2,10 +2,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 from bs4 import BeautifulSoup
+import time
 
 app = FastAPI()
 
-# Configuración de CORS obligatoria para que consumas la API desde tu Frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -13,122 +13,141 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-URL_HORARIO = "https://horarios.ulagos.cl/Global/carrera.php?carrera=3216&nivel=1&plan=3216II2020&sede=2028"
+# Estructura de caché en memoria local para guardar los semestres ya procesados
+# Estructura: { nivel_semestre: {"timestamp": float, "data": dict} }
+MEMORIA_CACHE = {}
+TIEMPO_EXPIRACION_CACHÉ = 86400  # Guardar los datos localmente por 24 horas (en segundos)
 
-@app.get("/api/horario")
-def obtener_horario():
+# URL base limpia sin el parámetro de nivel fijo
+URL_BASE_ULAGOS = "https://ulagos.cl"
+
+def mapear_html_horario(html_content):
+    """Procesa el HTML crudo y lo transforma en un diccionario estructurado"""
+    soup = BeautifulSoup(html_content, 'html.parser')
+    tabla = soup.find('table', class_='table-schedule') or soup.find('table')
+    if not tabla:
+        return None
+        
+    cuerpo_tabla = tabla.find('tbody')
+    if not cuerpo_tabla:
+        return None
+        
+    filas = cuerpo_tabla.find_all('tr')
+    horario_completo = []
+    dias_semana = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"]
+
+    for fila in filas:
+        clase_fila = fila.get('class', [])
+        clase_fila_str = "".join(clase_fila).lower()
+        if any(x in clase_fila_str for x in ['almuerzo', 'text-muted', 'table-light', 'footer']):
+            continue
+
+        celdas = fila.find_all('td')
+        if not celdas or len(celdas) < 2:
+            continue
+            
+        bloque_hora = " ".join(celdas.text.split())
+        if not bloque_hora:
+            continue
+
+        ramos_del_bloque = {}
+        
+        for indice, celda in enumerate(celdas[1:]):
+            if indice >= len(dias_semana):
+                break
+                
+            nombre_dia = dias_semana[indice]
+            div_actividad = celda.find('div', class_='actividad')
+            
+            if div_actividad:
+                lineas = [l.strip() for l in div_actividad.get_text(separator="\n").split("\n") if l.strip()]
+                
+                nombre_ramo, codigo, grupo, seccion, docente, sala = "", "", "", "", "", ""
+
+                for l in lineas:
+                    l_upper = l.upper()
+                    if "GRUPO:" in l_upper:
+                        grupo = l
+                    elif "SECCION:" in l_upper or "SECCIÓN:" in l_upper:
+                        seccion = l
+                    elif "SALA" in l_upper or "LABORATORIO" in l_upper:
+                        sala = l
+                    elif ":" in l and l.count(":") >= 2:
+                        codigo = l
+                    elif "02028:" in l:
+                        continue 
+                    else:
+                        if not nombre_ramo:
+                            nombre_ramo = l
+                        elif len(l) > 8 and not docente:
+                            if "(" in l or ")" in l:
+                                nombre_ramo += f" {l}"
+                            else:
+                                docente = l
+
+                ramos_del_bloque[nombre_dia] = {
+                    "nombre": nombre_ramo.strip(),
+                    "codigo": codigo.strip(),
+                    "grupo": grupo.strip(),
+                    "seccion": seccion.strip(),
+                    "docente": docente.strip(),
+                    "sala": sala.strip()
+                }
+            else:
+                ramos_del_bloque[nombre_dia] = None
+        
+        horario_completo.append({
+            "bloque": bloque_hora,
+            "clases": ramos_del_bloque
+        })
+        
+    return [b for b in horario_completo if any(b["clases"].values()) or "13:15" not in b["bloque"]]
+
+
+# Endpoint optimizado con parámetro de ruta para consultar cualquier semestre (del 1 al 10)
+@app.get("/api/horario/{nivel}")
+def obtener_horario_por_semestre(nivel: int):
+    # Validar que el semestre solicitado se encuentre en el rango académico real
+    if nivel < 1 or nivel > 11 or nivel == 6:
+        return {"error": "El semestre solicitado debe estar comprendido entre el 1 y el 11 exceptuando el 6."}
+
+    tiempo_actual = time.time()
+    
+    # Verificación de Caché: Si el semestre ya se consultó y no ha expirado, se retorna de inmediato
+    if nivel in MEMORIA_CACHE:
+        cache_data = MEMORIA_CACHE[nivel]
+        if tiempo_actual - cache_data["timestamp"] < TIEMPO_EXPIRACION_CACHÉ:
+            return cache_data["data"]
+
+    # Si no está en caché o ya expiró, se realiza la petición correspondiente a la universidad
     try:
-        # User-Agent para simular un navegador real y evitar bloqueos de la universidad
+        url_especifica = f"{URL_BASE_ULAGOS}&nivel={nivel}"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        respuesta = requests.get(URL_HORARIO, headers=headers, timeout=12)
+        
+        respuesta = requests.get(url_especifica, headers=headers, timeout=12)
         
         if respuesta.status_code != 200:
-            return {"error": f"No se pudo conectar a la Ulagos. Código de estado: {respuesta.status_code}"}
+            return {"error": f"Error de comunicación con el portal institucional ({respuesta.status_code})"}
             
-        soup = BeautifulSoup(respuesta.text, 'html.parser')
+        datos_procesados = mapear_html_horario(respuesta.text)
         
-        # Localizar la tabla de horarios
-        tabla = soup.find('table', class_='table-schedule') or soup.find('table')
-        if not tabla:
-            return {"error": "Estructura de tabla inválida o modificada en el portal de la universidad."}
+        if not datos_procesados:
+            return {"error": f"La estructura académica para el semestre {nivel} no pudo ser parseada."}
             
-        cuerpo_tabla = tabla.find('tbody')
-        if not cuerpo_tabla:
-            return {"error": "No se encontró el elemento tbody dentro de la tabla."}
-            
-        filas = cuerpo_tabla.find_all('tr')
-        
-        horario_completo = []
-        dias_semana = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"]
-
-        for fila in filas:
-            # 1. Filtro estricto para saltar filas vacías o decorativas (como la de almuerzo o notas al pie)
-            clase_fila = fila.get('class', [])
-            clase_fila_str = "".join(clase_fila).lower()
-            if any(x in clase_fila_str for x in ['almuerzo', 'text-muted', 'table-light', 'footer']):
-                continue
-
-            celdas = fila.find_all('td')
-            # Si no contiene al menos la celda de la hora y un día, la ignoramos
-            if not celdas or len(celdas) < 2:
-                continue
-                
-            # Limpiar el bloque de la hora (Ejemplo: "1 08:30 - 09:15")
-            bloque_hora = " ".join(celdas[0].text.split())
-            if not bloque_hora:
-                continue
-
-            ramos_del_bloque = {}
-            
-            # 2. Recorrer de forma exacta las celdas correspondientes a los 6 días académicos
-            for indice, celda in enumerate(celdas[1:]):
-                if indice >= len(dias_semana):
-                    break
-                    
-                nombre_dia = dias_semana[indice]
-                div_actividad = celda.find('div', class_='actividad')
-                
-                if div_actividad:
-                    # Extraemos todas las cadenas de texto del bloque de la materia limpiando espacios vacíos
-                    lineas = [l.strip() for l in div_actividad.get_text(separator="\n").split("\n") if l.strip()]
-                    
-                    # Inicializamos los campos vacíos predeterminados
-                    nombre_ramo = ""
-                    codigo = ""
-                    grupo = ""
-                    seccion = ""
-                    docente = ""
-                    sala = ""
-
-                    # 3. Lógica inteligente basada en el contenido real de los textos extraídos
-                    for l in lineas:
-                        l_upper = l.upper()
-                        if "GRUPO:" in l_upper:
-                            grupo = l
-                        elif "SECCION:" in l_upper or "SECCIÓN:" in l_upper:
-                            seccion = l
-                        elif "SALA" in l_upper or "LABORATORIO" in l_upper:
-                            sala = l
-                        elif ":" in l and l.count(":") >= 2: # Detecta códigos de ramo complejos tipo "CBI01:3216:2028:1"
-                            codigo = l
-                        elif "02028:" in l: # Filtramos e ignoramos metadatos internos de campus (ej: 02028:S202CCH)
-                            continue 
-                        else:
-                            # Si es la primera línea de texto legible y no cumple lo anterior, es el Nombre de la materia
-                            if not nombre_ramo:
-                                nombre_ramo = l
-                            # Si ya tenemos el nombre de la materia pero la línea sigue siendo texto en mayúsculas largo, es el Docente
-                            elif len(l) > 8 and not docente:
-                                # Evaluamos si contiene el tipo de clase para anexarlo al título (ej: "(CATEDRA)" o "(PRACTICO/TALLER)")
-                                if "(" in l or ")" in l:
-                                    nombre_ramo += f" {l}"
-                                else:
-                                    docente = l
-
-                    ramos_del_bloque[nombre_dia] = {
-                        "nombre": nombre_ramo.strip(),
-                        "codigo": codigo.strip(),
-                        "grupo": grupo.strip(),
-                        "seccion": seccion.strip(),
-                        "docente": docente.strip(),
-                        "sala": sala.strip()
-                    }
-                else:
-                    # Si no hay div de actividad, este bloque y día específico están totalmente libres
-                    ramos_del_bloque[nombre_dia] = None
-            
-            horario_completo.append({
-                "bloque": bloque_hora,
-                "clases": ramos_del_bloque
-            })
-            
-        return {
+        json_respuesta = {
             "carrera": "Ingeniería Civil en Informática",
             "sede": "Puerto Montt",
-            "plan": "3216II2020",
-            "horario": [b for b in horario_completo if any(b["clases"].values()) or "13:15" not in b["bloque"]] 
-            # El filtro final remueve bloques totalmente vacíos que ensucian el JSON si no tienen clases asociadas
+            "semestre_consultado": nivel,
+            "horario": datos_procesados
         }
         
+        # Guardar el resultado en la caché en memoria antes de responderle al usuario
+        MEMORIA_CACHE[nivel] = {
+            "timestamp": tiempo_actual,
+            "data": json_respuesta
+        }
+        
+        return json_respuesta
+        
     except Exception as e:
-        return {"error": f"Fallo crítico en el procesamiento de datos: {str(e)}"}
+        return {"error": f"Fallo crítico en el procesamiento del semestre {nivel}: {str(e)}"}
