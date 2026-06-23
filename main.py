@@ -5,7 +5,6 @@ from bs4 import BeautifulSoup
 
 app = FastAPI()
 
-# Permite que tu frontend consulte esta API sin problemas de CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,39 +17,38 @@ URL_HORARIO = "https://ulagos.cl"
 @app.get("/api/horario")
 def obtener_horario():
     try:
-        # 1. Descargar el HTML de la Universidad de Los Lagos
-        headers = {"User-Agent": "Mozilla/5.0"}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         respuesta = requests.get(URL_HORARIO, headers=headers, timeout=10)
         
         if respuesta.status_code != 200:
-            return {"error": f"Error de conexión con la U. de Los Lagos ({respuesta.status_code})"}
+            return {"error": f"Error de conexión con la Ulagos ({respuesta.status_code})"}
             
         soup = BeautifulSoup(respuesta.text, 'html.parser')
         
-        # 2. Buscar la tabla del horario
-        tabla = soup.find('table', class_='table-schedule')
+        # Corrección 1: Buscamos cualquier tabla en la página si no encuentra la clase específica
+        tabla = soup.find('table', class_='table-schedule') or soup.find('table')
         if not tabla:
-            return {"error": "No se encontró la tabla de horarios en el sitio."}
+            return {"error": "No se encontró ninguna tabla de horarios en el sitio."}
             
         cuerpo_tabla = tabla.find('tbody')
+        if not cuerpo_tabla:
+            return {"error": "La tabla no contiene un elemento tbody."}
+            
         filas = cuerpo_tabla.find_all('tr')
         
         horario_completo = []
         dias_semana = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"]
 
-        # 3. Recorrer cada bloque de hora (cada fila <tr>)
         for fila in filas:
             celdas = fila.find_all('td')
             if not celdas:
                 continue
                 
-            # La primera celda (index 0) corresponde a la hora del bloque (ej: 08:30 - 09:15)
-            # Quitamos espacios extras y saltos de línea con strip()
-            bloque_hora = celdas[0].text.strip().replace('\n', ' ')
-            
+            # Extraer el bloque horario limpiando espacios en blanco
+            bloque_hora = " ".join(celdas[0].text.split())
             ramos_del_bloque = {}
             
-            # Recorrer los días de la semana (celdas de la 1 en adelante)
+            # Revisar las celdas de los días (Lunes a Sábado)
             for indice, celda in enumerate(celdas[1:]):
                 if indice >= len(dias_semana):
                     break
@@ -58,26 +56,45 @@ def obtener_horario():
                 nombre_dia = dias_semana[indice]
                 div_actividad = celda.find('div', class_='actividad')
                 
-                # Si hay clase en este bloque y día
                 if div_actividad:
-                    # Buscamos todos los campos internos usando los ids que se ven en tu imagen
-                    spans = div_actividad.find_all('span', id='mat')
+                    # Corrección 2: Extraemos todas las líneas de texto ignorando las etiquetas intermedias
+                    lineas = [linea.strip() for linea in div_actividad.get_text(separator="\n").split("\n") if linea.strip()]
                     
-                    # Estructuramos la info de forma segura evitando errores si falta algún dato
-                    info_ramo = {
-                        "nombre": spans[0].text.strip() if len(spans) > 0 else "",
-                        "codigo": spans[1].text.strip() if len(spans) > 1 else "",
-                        "grupo": spans[2].text.strip() if len(spans) > 2 else "",
-                        "seccion": spans[3].text.strip() if len(spans) > 3 else "",
-                        "docente": div_actividad.find('span', id='docente').text.strip() if div_actividad.find('span', id='docente') else "",
-                        "sala": div_actividad.find('span', id='carrera').text.strip() if div_actividad.find('span', id='carrera') else ""
+                    # Inicializamos los campos vacíos por seguridad
+                    nombre_ramo = lineas[0] if len(lineas) > 0 else ""
+                    tipo_clase = lineas[1] if len(lineas) > 1 else ""
+                    codigo_ramo = lineas[2] if len(lineas) > 2 else ""
+                    grupo = lineas[3] if len(lineas) > 3 else ""
+                    seccion = lineas[4] if len(lineas) > 4 else ""
+                    
+                    # Buscar de forma independiente el docente y la sala usando lo que contenga la cadena
+                    docente = ""
+                    sala = ""
+                    for l in lineas:
+                        if "SALA" in l.upper() or "LABORATORIO" in l.upper():
+                            sala = l
+                        elif any(apellido in l.upper() for apellido in ["SEGOVIA", "CARRASCO", "PROFESOR", "DOCENTE"]): 
+                            # Si la línea tiene nombres o apellidos largos (y no es lo anterior), asumimos que es el docente
+                            if l != nombre_ramo and l != tipo_clase and l != codigo_ramo and l != grupo and l != seccion and l != sala:
+                                docente = l
+
+                    # Si el filtrado manual de docente no engancha, usamos una posición estimada por defecto
+                    if not docente and len(lineas) > 5:
+                        docente = lineas[5]
+                    if not sala and len(lineas) > 6:
+                        sala = lineas[6]
+
+                    ramos_del_bloque[nombre_dia] = {
+                        "nombre": f"{nombre_ramo} {tipo_clase}".strip(),
+                        "codigo": codigo_ramo,
+                        "grupo": grupo,
+                        "seccion": seccion,
+                        "docente": docente,
+                        "sala": sala
                     }
-                    ramos_del_bloque[nombre_dia] = info_ramo
                 else:
-                    # Bloque libre para este día
                     ramos_del_bloque[nombre_dia] = None
             
-            # Guardamos la fila procesada
             horario_completo.append({
                 "bloque": bloque_hora,
                 "clases": ramos_del_bloque
