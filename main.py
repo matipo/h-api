@@ -103,7 +103,6 @@ def mapear_html_horario(html_content):
         
     return [b for b in horario_completo if any(b["clases"].values()) or "13:15" not in b["bloque"]]
 
-
 # Endpoint optimizado con parámetro de ruta para consultar cualquier semestre (del 1 al 10)
 @app.get("/api/horario/{nivel}")
 def obtener_horario_por_semestre(nivel: int):
@@ -121,10 +120,14 @@ def obtener_horario_por_semestre(nivel: int):
 
     # Si no está en caché o ya expiró, se realiza la petición correspondiente a la universidad
     try:
-        url_especifica = f"{URL_BASE_ULAGOS}&nivel={nivel}"
+        # 💻 CORRECCIÓN: Se eliminó la concatenación manual incorrecta con '&'
+        # Si la URL base de la página del horario tiene una ruta específica (ej: "https://ulagos.cl"), 
+        # asegúrate de cambiar el valor de URL_BASE_ULAGOS arriba en tu archivo.
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        parametros = {"nivel": nivel}
         
-        respuesta = requests.get(url_especifica, headers=headers, timeout=12)
+        # requests se encarga automáticamente de armar la URL de forma correcta usando '?'
+        respuesta = requests.get(URL_BASE_ULAGOS, headers=headers, params=parametros, timeout=12)
         
         if respuesta.status_code != 200:
             return {"error": f"Error de comunicación con el portal institucional ({respuesta.status_code})"}
