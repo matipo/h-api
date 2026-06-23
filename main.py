@@ -18,8 +18,9 @@ app.add_middleware(
 MEMORIA_CACHE = {}
 TIEMPO_EXPIRACION_CACHÉ = 86400  # Guardar los datos localmente por 24 horas (en segundos)
 
-# URL base limpia sin el parámetro de nivel fijo
-URL_BASE_ULAGOS = "https://ulagos.cl"
+
+URL_BASE_ULAGOS = "https://horarios.ulagos.cl/ptomontt/carreras.php"
+
 
 def mapear_html_horario(html_content):
     """Procesa el HTML crudo y lo transforma en un diccionario estructurado"""
