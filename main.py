@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 
 app = FastAPI()
 
+# Configuración de CORS obligatoria para que consumas la API desde tu Frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -12,27 +13,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-URL_HORARIO = "https://ulagos.cl"
+URL_HORARIO = "https://horarios.ulagos.cl/Global/carrera.php?carrera=3216&nivel=1&plan=3216II2020&sede=2028"
 
 @app.get("/api/horario")
 def obtener_horario():
     try:
+        # User-Agent para simular un navegador real y evitar bloqueos de la universidad
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        respuesta = requests.get(URL_HORARIO, headers=headers, timeout=10)
+        respuesta = requests.get(URL_HORARIO, headers=headers, timeout=12)
         
         if respuesta.status_code != 200:
-            return {"error": f"Error de conexión con la Ulagos ({respuesta.status_code})"}
+            return {"error": f"No se pudo conectar a la Ulagos. Código de estado: {respuesta.status_code}"}
             
         soup = BeautifulSoup(respuesta.text, 'html.parser')
         
-        # Corrección 1: Buscamos cualquier tabla en la página si no encuentra la clase específica
+        # Localizar la tabla de horarios
         tabla = soup.find('table', class_='table-schedule') or soup.find('table')
         if not tabla:
-            return {"error": "No se encontró ninguna tabla de horarios en el sitio."}
+            return {"error": "Estructura de tabla inválida o modificada en el portal de la universidad."}
             
         cuerpo_tabla = tabla.find('tbody')
         if not cuerpo_tabla:
-            return {"error": "La tabla no contiene un elemento tbody."}
+            return {"error": "No se encontró el elemento tbody dentro de la tabla."}
             
         filas = cuerpo_tabla.find_all('tr')
         
@@ -40,15 +42,25 @@ def obtener_horario():
         dias_semana = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"]
 
         for fila in filas:
+            # 1. Filtro estricto para saltar filas vacías o decorativas (como la de almuerzo o notas al pie)
+            clase_fila = fila.get('class', [])
+            clase_fila_str = "".join(clase_fila).lower()
+            if any(x in clase_fila_str for x in ['almuerzo', 'text-muted', 'table-light', 'footer']):
+                continue
+
             celdas = fila.find_all('td')
-            if not celdas:
+            # Si no contiene al menos la celda de la hora y un día, la ignoramos
+            if not celdas or len(celdas) < 2:
                 continue
                 
-            # Extraer el bloque horario limpiando espacios en blanco
+            # Limpiar el bloque de la hora (Ejemplo: "1 08:30 - 09:15")
             bloque_hora = " ".join(celdas[0].text.split())
+            if not bloque_hora:
+                continue
+
             ramos_del_bloque = {}
             
-            # Revisar las celdas de los días (Lunes a Sábado)
+            # 2. Recorrer de forma exacta las celdas correspondientes a los 6 días académicos
             for indice, celda in enumerate(celdas[1:]):
                 if indice >= len(dias_semana):
                     break
@@ -57,42 +69,52 @@ def obtener_horario():
                 div_actividad = celda.find('div', class_='actividad')
                 
                 if div_actividad:
-                    # Corrección 2: Extraemos todas las líneas de texto ignorando las etiquetas intermedias
-                    lineas = [linea.strip() for linea in div_actividad.get_text(separator="\n").split("\n") if linea.strip()]
+                    # Extraemos todas las cadenas de texto del bloque de la materia limpiando espacios vacíos
+                    lineas = [l.strip() for l in div_actividad.get_text(separator="\n").split("\n") if l.strip()]
                     
-                    # Inicializamos los campos vacíos por seguridad
-                    nombre_ramo = lineas[0] if len(lineas) > 0 else ""
-                    tipo_clase = lineas[1] if len(lineas) > 1 else ""
-                    codigo_ramo = lineas[2] if len(lineas) > 2 else ""
-                    grupo = lineas[3] if len(lineas) > 3 else ""
-                    seccion = lineas[4] if len(lineas) > 4 else ""
-                    
-                    # Buscar de forma independiente el docente y la sala usando lo que contenga la cadena
+                    # Inicializamos los campos vacíos predeterminados
+                    nombre_ramo = ""
+                    codigo = ""
+                    grupo = ""
+                    seccion = ""
                     docente = ""
                     sala = ""
-                    for l in lineas:
-                        if "SALA" in l.upper() or "LABORATORIO" in l.upper():
-                            sala = l
-                        elif any(apellido in l.upper() for apellido in ["SEGOVIA", "CARRASCO", "PROFESOR", "DOCENTE"]): 
-                            # Si la línea tiene nombres o apellidos largos (y no es lo anterior), asumimos que es el docente
-                            if l != nombre_ramo and l != tipo_clase and l != codigo_ramo and l != grupo and l != seccion and l != sala:
-                                docente = l
 
-                    # Si el filtrado manual de docente no engancha, usamos una posición estimada por defecto
-                    if not docente and len(lineas) > 5:
-                        docente = lineas[5]
-                    if not sala and len(lineas) > 6:
-                        sala = lineas[6]
+                    # 3. Lógica inteligente basada en el contenido real de los textos extraídos
+                    for l in lineas:
+                        l_upper = l.upper()
+                        if "GRUPO:" in l_upper:
+                            grupo = l
+                        elif "SECCION:" in l_upper or "SECCIÓN:" in l_upper:
+                            seccion = l
+                        elif "SALA" in l_upper or "LABORATORIO" in l_upper:
+                            sala = l
+                        elif ":" in l and l.count(":") >= 2: # Detecta códigos de ramo complejos tipo "CBI01:3216:2028:1"
+                            codigo = l
+                        elif "02028:" in l: # Filtramos e ignoramos metadatos internos de campus (ej: 02028:S202CCH)
+                            continue 
+                        else:
+                            # Si es la primera línea de texto legible y no cumple lo anterior, es el Nombre de la materia
+                            if not nombre_ramo:
+                                nombre_ramo = l
+                            # Si ya tenemos el nombre de la materia pero la línea sigue siendo texto en mayúsculas largo, es el Docente
+                            elif len(l) > 8 and not docente:
+                                # Evaluamos si contiene el tipo de clase para anexarlo al título (ej: "(CATEDRA)" o "(PRACTICO/TALLER)")
+                                if "(" in l or ")" in l:
+                                    nombre_ramo += f" {l}"
+                                else:
+                                    docente = l
 
                     ramos_del_bloque[nombre_dia] = {
-                        "nombre": f"{nombre_ramo} {tipo_clase}".strip(),
-                        "codigo": codigo_ramo,
-                        "grupo": grupo,
-                        "seccion": seccion,
-                        "docente": docente,
-                        "sala": sala
+                        "nombre": nombre_ramo.strip(),
+                        "codigo": codigo.strip(),
+                        "grupo": grupo.strip(),
+                        "seccion": seccion.strip(),
+                        "docente": docente.strip(),
+                        "sala": sala.strip()
                     }
                 else:
+                    # Si no hay div de actividad, este bloque y día específico están totalmente libres
                     ramos_del_bloque[nombre_dia] = None
             
             horario_completo.append({
@@ -103,8 +125,10 @@ def obtener_horario():
         return {
             "carrera": "Ingeniería Civil en Informática",
             "sede": "Puerto Montt",
-            "horario": horario_completo
+            "plan": "3216II2020",
+            "horario": [b for b in horario_completo if any(b["clases"].values()) or "13:15" not in b["bloque"]] 
+            # El filtro final remueve bloques totalmente vacíos que ensucian el JSON si no tienen clases asociadas
         }
         
     except Exception as e:
-        return {"error": f"Ocurrió un error en el servidor: {str(e)}"}
+        return {"error": f"Fallo crítico en el procesamiento de datos: {str(e)}"}
