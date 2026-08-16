@@ -69,10 +69,14 @@ def mapear_html_horario(html_content):
                 lineas = [l.strip() for l in texto_limpio.split("\n") if l.strip()]
                 
                 nombre_ramo, codigo, grupo, seccion, docente, sala = "", "", "", "", "", ""
+                sala_pendiente = False
 
                 for l in lineas:
                     l_upper = l.upper()
-                    if "GRUPO:" in l_upper:
+                    if sala_pendiente:
+                        sala = l
+                        sala_pendiente = False
+                    elif "GRUPO:" in l_upper:
                         grupo = l
                     elif "SECCION:" in l_upper or "SECCIÓN:" in l_upper:
                         seccion = l
@@ -81,7 +85,7 @@ def mapear_html_horario(html_content):
                     elif ":" in l and l.count(":") >= 2:
                         codigo = l
                     elif "02028:" in l:
-                        continue 
+                        sala_pendiente = True
                     else:
                         if not nombre_ramo:
                             nombre_ramo = l
